@@ -13,6 +13,9 @@ import (
 	hubgenesis "github.com/dymensionxyz/dymension-rdk/x/hub-genesis"
 	hubgenkeeper "github.com/dymensionxyz/dymension-rdk/x/hub-genesis/keeper"
 	hubgentypes "github.com/dymensionxyz/dymension-rdk/x/hub-genesis/types"
+	hubtypes "github.com/dymensionxyz/dymension-rdk/x/hub/types"
+
+	hubkeeper "github.com/dymensionxyz/dymension-rdk/x/hub/keeper"
 
 	"github.com/cosmos/cosmos-sdk/std"
 	"github.com/gorilla/mux"
@@ -134,7 +137,7 @@ var kvstorekeys = []string{
 	minttypes.StoreKey, distrtypes.StoreKey,
 	govtypes.StoreKey, paramstypes.StoreKey,
 	ibchost.StoreKey, upgradetypes.StoreKey,
-	epochstypes.StoreKey, hubgentypes.StoreKey,
+	epochstypes.StoreKey, hubgentypes.StoreKey, hubtypes.StoreKey,
 	ibctransfertypes.StoreKey, capabilitytypes.StoreKey, gaslesstypes.StoreKey, wasmtypes.StoreKey,
 }
 
@@ -226,6 +229,7 @@ type App struct {
 	DistrKeeper      distrkeeper.Keeper
 	GaslessKeeper    gaslesskeeper.Keeper
 	GovKeeper        govkeeper.Keeper
+	HubKeeper        hubkeeper.Keeper
 	HubGenesisKeeper hubgenkeeper.Keeper
 	UpgradeKeeper    upgradekeeper.Keeper
 	ParamsKeeper     paramskeeper.Keeper
@@ -364,8 +368,14 @@ func NewRollapp(
 	)
 
 	app.DistrKeeper = distrkeeper.NewKeeper(
-		appCodec, keys[distrtypes.StoreKey], app.GetSubspace(distrtypes.ModuleName), app.AccountKeeper, app.BankKeeper,
-		&stakingKeeper, &app.SequencersKeeper, authtypes.FeeCollectorName, app.ModuleAccountAddrs(),
+		appCodec,
+		keys[distrtypes.StoreKey],
+		app.GetSubspace(distrtypes.ModuleName),
+		app.AccountKeeper,
+		app.BankKeeper,
+		&stakingKeeper,
+		&app.SequencersKeeper,
+		authtypes.FeeCollectorName,
 	)
 
 	app.UpgradeKeeper = upgradekeeper.NewKeeper(skipUpgradeHeights, keys[upgradetypes.StoreKey], appCodec, homePath, app.BaseApp, authtypes.NewModuleAddress(govtypes.ModuleName).String())
@@ -417,12 +427,33 @@ func NewRollapp(
 		),
 	)
 
+	app.HubKeeper = hubkeeper.NewKeeper(
+		appCodec,
+		keys[hubtypes.StoreKey],
+	)
+
+	denomMetadataMiddleware := denommetadata.NewICS4Wrapper(
+		app.IBCKeeper.ChannelKeeper,
+		app.HubKeeper,
+		app.BankKeeper,
+		app.HubGenesisKeeper.GetState,
+	)
+
+	app.HubGenesisKeeper = hubgenkeeper.NewKeeper(
+		appCodec,
+		keys[hubgentypes.StoreKey],
+		app.GetSubspace(hubgentypes.ModuleName),
+		app.AccountKeeper,
+	)
+
+	genesisTransfersBlocker := hubgenkeeper.NewICS4Wrapper(denomMetadataMiddleware, app.HubGenesisKeeper)
+
 	// Create Transfer Keepers
 	app.TransferKeeper = ibctransferkeeper.NewKeeper(
 		appCodec,
 		keys[ibctransfertypes.StoreKey],
 		app.GetSubspace(ibctransfertypes.ModuleName),
-		app.IBCKeeper.ChannelKeeper,
+		genesisTransfersBlocker,
 		app.IBCKeeper.ChannelKeeper,
 		&app.IBCKeeper.PortKeeper,
 		app.AccountKeeper,
@@ -432,18 +463,18 @@ func NewRollapp(
 
 	var transferStack ibcporttypes.IBCModule
 	transferStack = ibctransfer.NewIBCModule(app.TransferKeeper)
-	transferStack = denommetadata.NewIBCMiddleware(
+	transferStack = denommetadata.NewIBCModule(
 		transferStack,
 		app.BankKeeper,
 		app.TransferKeeper,
+		app.HubKeeper,
 		denommetadatamoduletypes.NewMultiDenommetadataHooks(),
 	)
-
-	app.HubGenesisKeeper = hubgenkeeper.NewKeeper(
-		appCodec,
-		keys[hubgentypes.StoreKey],
-		app.GetSubspace(hubgentypes.ModuleName),
-		app.AccountKeeper,
+	transferStack = hubgenkeeper.NewIBCModule(
+		transferStack,
+		app.TransferKeeper,
+		app.HubGenesisKeeper,
+		app.BankKeeper,
 	)
 
 	app.GaslessKeeper = gaslesskeeper.NewKeeper(
@@ -738,10 +769,11 @@ func (app *App) ModuleAccountAddrs() map[string]bool {
 }
 
 // BlockedModuleAccountAddrs returns all the app's blocked module account
-// addresses.
+// addresses. A true value means blocked. Absent or false means not blocked.
 func (app *App) BlockedModuleAccountAddrs() map[string]bool {
 	modAccAddrs := app.ModuleAccountAddrs()
 	delete(modAccAddrs, authtypes.NewModuleAddress(govtypes.ModuleName).String())
+	delete(modAccAddrs, authtypes.NewModuleAddress(hubgentypes.ModuleName).String())
 
 	return modAccAddrs
 }
